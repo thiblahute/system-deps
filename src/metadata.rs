@@ -219,6 +219,11 @@ impl MetaData {
                     let cfg_exp = cfg_expr::Expression::parse(name)?;
 
                     for mut dep in Self::parse_deps_table(value, &format!("{key}.{name}"), false)? {
+                        // Skip deps that only have binary-related fields (url, checksum, etc.)
+                        // and no version — these are handled by system-deps-meta, not here.
+                        if dep.version.is_none() && dep.version_overrides.is_empty() {
+                            continue;
+                        }
                         dep.cfg = Some(cfg_exp.clone());
                         deps.push(dep);
                     }

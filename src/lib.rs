@@ -836,10 +836,25 @@ impl Config {
         let metadata = MetaData::from_file(&path)?;
         let mut libraries = Dependencies::default();
 
+        // Collect keys that have an unconditional (non-cfg) dep so we can skip
+        // cfg-gated duplicates that only carry binary metadata.
+        let unconditional_keys: std::collections::HashSet<_> = metadata
+            .deps
+            .iter()
+            .filter(|d| d.cfg.is_none())
+            .map(|d| &d.key)
+            .collect();
+
         for dep in metadata.deps.iter() {
             if let Some(cfg) = &dep.cfg {
                 // Check if `cfg()` expression matches the target settings
                 if !self.check_cfg(cfg)? {
+                    continue;
+                }
+                // Skip cfg-gated deps whose key also has an unconditional entry.
+                // The cfg-gated entry typically only carries binary-related metadata
+                // (url, checksum, etc.) handled by system-deps-meta, not here.
+                if unconditional_keys.contains(&dep.key) {
                     continue;
                 }
             }
