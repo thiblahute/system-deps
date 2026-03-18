@@ -19,10 +19,13 @@ flate2 = { version = "1.1", optional = true }
 xz = { version = "0.1", optional = true }
 tar = { version = "0.4", optional = true }
 zip = { version = "2.4", optional = true }
+pkg-extractor = { git = "https://github.com/thiblahute/pkg_extractor", optional = true }
+walkdir = "2.3"
 
 [features]
 binary = ["dep:sha256", "dep:attohttpc"]
 gz = ["dep:flate2", "dep:tar"]
 xz = ["dep:xz", "dep:tar"]
 zip = ["dep:zip"]
+pkg = ["dep:pkg-extractor"]
 test = []

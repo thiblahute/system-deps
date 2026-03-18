@@ -25,6 +25,9 @@ pub enum Extension {
     /// A `.zip` archive.
     #[cfg(feature = "zip")]
     Zip,
+    /// A macOS `.pkg` (Apple flat package) archive.
+    #[cfg(feature = "pkg")]
+    Pkg,
     Folder,
 }
 
@@ -45,6 +48,8 @@ impl TryFrom<&Path> for Extension {
             return Err(BinaryError::UnsupportedExtension("<error>".into()));
         };
         match ext {
+            #[cfg(feature = "pkg")]
+            e if e == "pkg" => Ok(Extension::Pkg),
             #[cfg(feature = "gz")]
             e if e == "gz" || e == "tgz" => Ok(Extension::TarGz),
             #[cfg(feature = "xz")]
@@ -357,6 +362,9 @@ fn make_available(bin: UrlBinary, dst: &Path) -> Result<(), BinaryError> {
     // Decompress the binary archive
     decompress(&file, dst, ext)?;
 
+    // Generate info.toml with auto-detected pkgconfig paths
+    create_info_file(dst)?;
+
     Ok(())
 }
 
@@ -386,8 +394,88 @@ fn decompress(_file: &[u8], _dst: &Path, ext: Extension) -> Result<(), BinaryErr
                 .extract(_dst)
                 .map_err(|e| BinaryError::DecompressError(e.into()))
         }
+        #[cfg(feature = "pkg")]
+        Extension::Pkg => {
+            let reader = std::io::Cursor::new(_file);
+            pkg_extractor::PkgExtractor::new(reader, Some(_dst.into()))
+                .extract()
+                .map_err(|e| {
+                    BinaryError::DecompressError(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("{e:?}"),
+                    ))
+                })
+        }
         _ => unreachable!(),
     }
+}
+
+/// Generate an `info.toml` file listing all directories containing `.pc` files.
+/// `lib/pkgconfig` is always listed first if it exists.
+fn create_info_file(dst: &Path) -> Result<(), BinaryError> {
+    let info_path = dst.join("info.toml");
+    if info_path.exists() {
+        return Ok(());
+    }
+
+    let mut pc_dirs = Vec::new();
+
+    // Prioritize lib/pkgconfig
+    let lib_pkgconfig = dst.join("lib").join("pkgconfig");
+    if lib_pkgconfig.exists() && lib_pkgconfig.is_dir() {
+        pc_dirs.push(
+            lib_pkgconfig
+                .strip_prefix(dst)
+                .map_err(|e| {
+                    BinaryError::DecompressError(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e,
+                    ))
+                })?
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+
+    // Walk the directory tree looking for .pc files
+    for entry in walkdir::WalkDir::new(dst)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "pc") {
+            if let Some(parent) = path.parent() {
+                let rel_path = parent
+                    .strip_prefix(dst)
+                    .map_err(|e| {
+                        BinaryError::DecompressError(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            e,
+                        ))
+                    })?
+                    .to_string_lossy()
+                    .into_owned();
+                if !pc_dirs.contains(&rel_path) {
+                    pc_dirs.push(rel_path);
+                }
+            }
+        }
+    }
+
+    let mut table = toml::Table::new();
+    table.insert(
+        "paths".to_string(),
+        toml::Value::Array(pc_dirs.into_iter().map(toml::Value::String).collect()),
+    );
+
+    fs::write(
+        info_path,
+        toml::to_string(&table).map_err(|e| {
+            BinaryError::DecompressError(std::io::Error::new(std::io::ErrorKind::Other, e))
+        })?,
+    )
+    .map_err(BinaryError::DecompressError)
 }
 
 pub fn merge(rhs: &mut Table, lhs: Table, force: bool) -> Result<(), Error> {
