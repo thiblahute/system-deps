@@ -935,9 +935,9 @@ impl Config {
             let name = &dep.key;
             let build_internal = self.get_build_internal_status(name)?;
 
-            // Is there an overrided pkg-config path for the library?
+            // `Some` only for a dep served by a downloaded binary bundle.
             // TODO: Pass package version here
-            let pkg_config_paths = self.query_path(name);
+            let prebuilt_pkg_config_paths = self.query_path(name);
 
             // should the lib be statically linked?
             let statik = cfg!(feature = "binary")
@@ -958,7 +958,18 @@ impl Config {
                     .range_version(metadata::parse_version(version))
                     .statik(statik);
 
-                let probe = Library::wrap_pkg_config(pkg_config_paths, || {
+                // Bundles ship pkg-config 0.29.2, whose `--define-prefix` (on by
+                // default on Windows) miscomputes `prefix` for nested layouts
+                // like `lib/gstreamer-1.0/pkgconfig`, inflating `${libdir}` to
+                // `<bundle>/lib/lib`. The bundled `.pc` carry correct
+                // `prefix=${pcfiledir}/...`, so disable it, but only when the
+                // tool accepts the flag (older ones lack the behaviour anyway).
+                #[cfg(windows)]
+                if prebuilt_pkg_config_paths.is_some() && pkg_config_accepts_dont_define_prefix() {
+                    config.arg("--dont-define-prefix");
+                }
+
+                let probe = Library::wrap_pkg_config(prebuilt_pkg_config_paths, || {
                     Self::probe_with_fallback(&config, lib_name, fallback_lib_names)
                 });
 
@@ -1256,6 +1267,13 @@ impl Library {
 
         let prev_paths = prev.iter().flat_map(env::split_paths).collect::<Vec<_>>();
         let joined_paths = pkg_config_paths.join_paths(prev_paths.as_slice());
+
+        // pkg-config 0.29.2 eats `\` while expanding `${pcfiledir}`, producing
+        // corrupt flags (e.g. `C:Userslibpkgconfig`). Forward slashes work on
+        // Windows and avoid this; there `\` is only ever a path separator.
+        #[cfg(windows)]
+        let joined_paths = OsString::from(joined_paths.to_string_lossy().replace('\\', "/"));
+
         env::set_var("PKG_CONFIG_PATH", joined_paths);
 
         let res = f();
@@ -1307,6 +1325,21 @@ impl Library {
         lib.statik = true;
         Ok(lib)
     }
+}
+
+/// Whether the resolved `pkg-config` accepts `--dont-define-prefix`. Cached.
+#[cfg(windows)]
+fn pkg_config_accepts_dont_define_prefix() -> bool {
+    use std::sync::OnceLock;
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let exe = env::var_os("PKG_CONFIG").unwrap_or_else(|| "pkg-config".into());
+        std::process::Command::new(exe)
+            .args(["--dont-define-prefix", "--version"])
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    })
 }
 
 /// A trait that can represent both a reference to a Path like object or a list of paths.

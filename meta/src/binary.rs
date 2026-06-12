@@ -405,11 +405,6 @@ fn make_available(bin: UrlBinary, dst: &Path) -> Result<(), BinaryError> {
     // Generate info.toml with auto-detected pkgconfig paths
     create_info_file(dst)?;
 
-    // Patch the bundle's `.pc` files so Windows pkg-config can't inflate
-    // `${libdir}` via its broken auto-prefix heuristic (see the helper).
-    #[cfg(windows)]
-    rewrite_pc_files(dst)?;
-
     // Write the checksum last so that concurrent build scripts of other
     // crates (each running their own `system-deps` build.rs) cannot observe
     // a "valid" directory until extraction and info.toml are fully written.
@@ -450,110 +445,6 @@ fn create_info_file(dst: &Path) -> Result<(), BinaryError> {
             .map_err(|e| BinaryError::DecompressError(std::io::Error::other(e)))?,
     )
     .map_err(BinaryError::DecompressError)
-}
-
-/// Pre-expand every `${var}` reference in each `.pc` file under `dst` and
-/// drop the `prefix=` declaration line.
-///
-/// Windows `pkg-config` 0.29.2 enables `--define-prefix` by default, which
-/// blindly strips two trailing components from `pcfiledir` to recompute
-/// `prefix` regardless of what the .pc file declares. That heuristic is
-/// correct for `<bundle>/lib/pkgconfig/foo.pc` (yields `<bundle>`) but wrong
-/// for `<bundle>/lib/gstreamer-1.0/pkgconfig/foo.pc` (yields `<bundle>/lib`),
-/// which inflates `${libdir}` to `<bundle>/lib/lib` and emits broken `-L`
-/// flags like `<bundle>/lib/lib/gstreamer-1.0`. The redefine fires only when
-/// a `prefix=` declaration is parsed, so dropping that line — combined with
-/// rewriting every `${var}` to its resolved absolute path beforehand —
-/// short-circuits the heuristic without needing a CLI flag (which we can't
-/// pass through `pkg-config-rs::Command::new`).
-///
-/// `pkgconf` (the modern replacement for the original `pkg-config`) does not
-/// suffer from this. We keep this workaround because the GStreamer Windows
-/// installer still ships `pkg-config 0.29.2`.
-#[cfg(windows)]
-fn rewrite_pc_files(dst: &Path) -> Result<(), BinaryError> {
-    for pc_dir in find_pkgconfig_dirs(dst) {
-        let entries = match fs::read_dir(&pc_dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "pc") {
-                rewrite_pc_file(&path)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn rewrite_pc_file(path: &Path) -> Result<(), BinaryError> {
-    let content = fs::read_to_string(path).map_err(BinaryError::DecompressError)?;
-    let pcfiledir = path
-        .parent()
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_default();
-    let mut vars: Vec<(String, String)> = vec![("pcfiledir".into(), pcfiledir)];
-    let mut out = String::with_capacity(content.len());
-
-    for line in content.lines() {
-        let substituted = expand_vars(line, &vars);
-
-        // Detect a top-level `var=value` declaration: `key` must be a bare
-        // identifier (no whitespace, no colon — a colon would mean this is a
-        // `Name:`/`Libs:`/`Cflags:` field).
-        let is_var_line = substituted
-            .find('=')
-            .filter(|&eq| {
-                let prefix = &substituted[..eq];
-                !prefix.is_empty()
-                    && !prefix.contains(':')
-                    && prefix
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
-            })
-            .map(|eq| {
-                (
-                    substituted[..eq].trim().to_string(),
-                    substituted[eq + 1..].trim().to_string(),
-                )
-            });
-
-        if let Some((key, value)) = is_var_line {
-            // Always record the var (later lines need it for substitution),
-            // then drop the `prefix=` line so the pkg-config 0.29.2
-            // `--define-prefix` heuristic finds nothing to override.
-            let is_prefix = key == "prefix";
-            vars.push((key, value));
-            if is_prefix {
-                continue;
-            }
-        }
-        out.push_str(&substituted);
-        out.push('\n');
-    }
-
-    fs::write(path, out).map_err(BinaryError::DecompressError)
-}
-
-#[cfg(windows)]
-fn expand_vars(line: &str, vars: &[(String, String)]) -> String {
-    let mut s = line.to_string();
-    let mut changed = true;
-    // Iterate until fixpoint to handle nested expansions (var values
-    // referencing other vars already in `vars`).
-    while changed {
-        changed = false;
-        for (k, v) in vars {
-            let pat = format!("${{{}}}", k);
-            if s.contains(&pat) {
-                s = s.replace(&pat, v);
-                changed = true;
-            }
-        }
-    }
-    s
 }
 
 /// Extract a binary archive to the target directory. The methods for unpacking are
