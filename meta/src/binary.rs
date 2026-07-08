@@ -460,7 +460,9 @@ fn decompress(_file: &[u8], _dst: &Path, ext: Extension) -> Result<(), BinaryErr
         }
         #[cfg(feature = "xz")]
         Extension::TarXz => {
-            let reader = liblzma::read::XzDecoder::new(_file);
+            // `true`: allow concatenated xz streams, matching the
+            // multi-stream tolerance of the previous liblzma decoder.
+            let reader = lzma_rust2::XzReader::new(_file, true);
             let mut archive = tar::Archive::new(reader);
             archive.unpack(_dst).map_err(BinaryError::DecompressError)
         }

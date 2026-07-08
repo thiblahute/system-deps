@@ -16,15 +16,16 @@ cfg-expr = { version = ">= 0.17, < 0.21", features = ["targets"] }
 sha256 = { version = "1.6", optional = true }
 attohttpc = { version = "0.29", optional = true }
 flate2 = { version = "1.1", optional = true }
-liblzma = { version = "0.4", default-features = false, optional = true }
+# Pure-Rust xz decoder. Must NOT be liblzma: on macOS the `pkg` feature pulls
+# apple-xar -> xz2 -> lzma-sys (links = "lzma"), and liblzma-sys also declares
+# links = "lzma". Two crates with the same `links` value fail to resolve. The
+# pure-Rust lzma-rust2 carries no `links` key, so it coexists with lzma-sys.
+lzma-rust2 = { version = "0.16", optional = true }
 tar = { version = "0.4", optional = true }
 which = { version = "8", optional = true }
 zip = { version = "2.4", default-features = false, features = ["aes-crypto", "bzip2", "deflate64", "deflate", "lzma", "time", "zstd"], optional = true }
 [target.'cfg(target_os = "macos")'.dependencies]
-# TODO: switch to a released `pkg-extractor` once the `liblzma` backend
-# migration (commit a1fdfd4 on thiblahute/pkg_extractor main) is cut as
-# a crates.io release; then this can become a plain `version = "..."`.
-pkg-extractor = { git = "https://github.com/thiblahute/pkg_extractor", branch = "main", optional = true }
+pkg-extractor = { version = "0.1.3", optional = true }
 [target.'cfg(target_os = "windows")'.dependencies]
 # TODO: switch to upstream `inno` once the `extract` feature lands there;
 # then this can become a plain `version = "..."` entry from crates.io.
@@ -34,7 +35,7 @@ junction = { version = "2", optional = true }
 [features]
 binary = ["dep:sha256", "dep:attohttpc", "dep:which", "dep:junction"]
 gz = ["dep:flate2", "dep:tar"]
-xz = ["dep:liblzma", "dep:tar"]
+xz = ["dep:lzma-rust2", "dep:tar"]
 zip = ["dep:zip"]
 pkg = ["dep:pkg-extractor"]
 inno = ["dep:inno"]
