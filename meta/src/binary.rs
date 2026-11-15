@@ -1,7 +1,8 @@
 use std::{
     collections::HashMap,
     convert::{TryFrom, TryInto},
-    fs, io,
+    fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::{mpsc, Mutex, OnceLock},
     thread,
@@ -627,6 +628,34 @@ fn make_available_once(bin: UrlBinary, dst: &Path) -> Result<(), BinaryError> {
 /// Retrieve a binary archive from the specified `url` and decompress it in the target directory.
 /// "Download" is used as an umbrella term, since this can also be a local file.
 fn make_available(bin: UrlBinary, dst: &Path) -> Result<(), BinaryError> {
+    make_available_in(bin, dst, archive_cache_dir())
+}
+
+/// Where downloaded archives are kept between builds: another target directory, or a clean
+/// build, does not download them again. `SYSTEM_DEPS_CACHE_DIR` overrides it.
+fn archive_cache_dir() -> Option<PathBuf> {
+    let env = |name: &str| {
+        std::env::var_os(name)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    if let Some(dir) = env("SYSTEM_DEPS_CACHE_DIR") {
+        return Some(dir);
+    }
+    #[cfg(windows)]
+    let base = env("LOCALAPPDATA");
+    #[cfg(target_os = "macos")]
+    let base = env("HOME").map(|h| h.join("Library/Caches"));
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let base = env("XDG_CACHE_HOME").or_else(|| env("HOME").map(|h| h.join(".cache")));
+    base.map(|b| b.join("system-deps"))
+}
+
+fn make_available_in(
+    bin: UrlBinary,
+    dst: &Path,
+    cache_dir: Option<PathBuf>,
+) -> Result<(), BinaryError> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     // Check whether the file is local or not
@@ -653,9 +682,28 @@ fn make_available(bin: UrlBinary, dst: &Path) -> Result<(), BinaryError> {
         return Ok(());
     }
 
-    // Use a local file or download from the web
-    let (file, expected_len) = if local {
-        (fs::read(url).map_err(BinaryError::LocalFileError)?, None)
+    // Use a local file, an archive downloaded by an earlier build, or stream the download to a
+    // temporary file. The archive is never held in memory: it is hashed and extracted from disk.
+    // The checksum names the cached archive: a SHA-256 digest only, never a path.
+    let cache = match (&bin.checksum, local) {
+        (Some(checksum), false)
+            if checksum.len() == 64 && checksum.bytes().all(|b| b.is_ascii_hexdigit()) =>
+        {
+            cache_dir
+                .filter(|dir| fs::create_dir_all(dir).is_ok())
+                .map(|dir| dir.join(checksum))
+        }
+        _ => None,
+    };
+    let cached = cache
+        .as_ref()
+        .filter(|path| sha256::try_digest(path.as_path()).ok() == bin.checksum)
+        .cloned();
+    let mut temp = None;
+    let (mut file, expected_len): (PathBuf, Option<u64>) = if local {
+        (PathBuf::from(url), None)
+    } else if let Some(cached) = cached {
+        (cached, None)
     } else {
         let res = attohttpc::get(url)
             .header("User-Agent", "system-deps")
@@ -663,20 +711,44 @@ fn make_available(bin: UrlBinary, dst: &Path) -> Result<(), BinaryError> {
         if res.status() == attohttpc::StatusCode::IM_A_TEAPOT {
             return Err(BinaryError::AntiBot(url.into()));
         }
-        let res = res.error_for_status()?;
+        let mut res = res.error_for_status()?;
         let expected_len = expected_len(res.headers());
-        (res.bytes()?, expected_len)
+        let path = match &cache {
+            Some(cache) => {
+                let mut name = cache.as_os_str().to_owned();
+                // Several bundles of one build can want the same archive at once.
+                static PARTIALS: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let count = PARTIALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                name.push(format!(".partial-{}-{}", std::process::id(), count));
+                PathBuf::from(name)
+            }
+            None => TempDownload::path(dst),
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(BinaryError::DecompressError)?;
+        }
+        let guard = temp.insert(TempDownload(path));
+        let mut out =
+            io::BufWriter::new(fs::File::create(&guard.0).map_err(BinaryError::DecompressError)?);
+        io::copy(&mut res, &mut out)
+            .and_then(|_| out.flush())
+            .map_err(|e| BinaryError::DownloadError(e.into()))?;
+        (guard.0.clone(), expected_len)
     };
 
     // Verify the checksum
-    let calculated = sha256::digest(&*file);
+    let calculated = sha256::try_digest(file.as_path()).map_err(BinaryError::LocalFileError)?;
+    let received = fs::metadata(&file)
+        .map_err(BinaryError::LocalFileError)?
+        .len();
     let checksum = match bin.checksum {
         Some(ch) if *ch == calculated => Ok(ch),
         _ => match expected_len {
-            Some(len) if (file.len() as u64) < len => Err(BinaryError::DownloadError(
+            Some(len) if received < len => Err(BinaryError::DownloadError(
                 io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    format!("{url}: received {} of {len} bytes", file.len()),
+                    format!("{url}: received {received} of {len} bytes"),
                 )
                 .into(),
             )),
@@ -687,10 +759,17 @@ fn make_available(bin: UrlBinary, dst: &Path) -> Result<(), BinaryError> {
             )),
         },
     }?;
+    // A verified download is kept for the next build. Failing to keep it is not an error.
+    if let (Some(guard), Some(cache)) = (&temp, &cache) {
+        if fs::rename(&guard.0, cache).is_ok() {
+            file = cache.clone();
+        }
+    }
     fs::create_dir_all(dst).map_err(BinaryError::DecompressError)?;
 
     // Decompress the binary archive
     decompress(&file, dst, ext)?;
+    drop(temp);
 
     // Generate info.toml with auto-detected pkgconfig paths
     create_info_file(dst)?;
@@ -750,14 +829,42 @@ fn create_info_file(dst: &Path) -> Result<(), BinaryError> {
     .map_err(BinaryError::DecompressError)
 }
 
+/// A downloaded archive in a temporary file, removed when dropped.
+struct TempDownload(PathBuf);
+
+impl TempDownload {
+    fn path(dst: &Path) -> PathBuf {
+        let mut name = dst.file_name().unwrap_or_default().to_os_string();
+        name.push(".download");
+        dst.with_file_name(name)
+    }
+}
+
+impl Drop for TempDownload {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(any(
+    feature = "gz",
+    feature = "xz",
+    feature = "zip",
+    all(feature = "pkg", target_os = "macos"),
+    all(feature = "inno", target_os = "windows")
+))]
+fn open(path: &Path) -> Result<fs::File, BinaryError> {
+    fs::File::open(path).map_err(BinaryError::DecompressError)
+}
+
 /// Extract a binary archive to the target directory. The methods for unpacking are
 /// different depending on the extension. Each file type is gated behind a feature to
 /// avoid having too many dependencies.
-fn decompress(_file: &[u8], _dst: &Path, ext: Extension) -> Result<(), BinaryError> {
+fn decompress(_file: &Path, _dst: &Path, ext: Extension) -> Result<(), BinaryError> {
     match ext {
         #[cfg(feature = "gz")]
         Extension::TarGz => {
-            let reader = flate2::read::GzDecoder::new(_file);
+            let reader = flate2::read::GzDecoder::new(open(_file)?);
             let mut archive = tar::Archive::new(reader);
             archive.unpack(_dst).map_err(BinaryError::DecompressError)
         }
@@ -765,13 +872,13 @@ fn decompress(_file: &[u8], _dst: &Path, ext: Extension) -> Result<(), BinaryErr
         Extension::TarXz => {
             // `true`: allow concatenated xz streams, matching the
             // multi-stream tolerance of the previous liblzma decoder.
-            let reader = lzma_rust2::XzReader::new(_file, true);
+            let reader = lzma_rust2::XzReader::new(io::BufReader::new(open(_file)?), true);
             let mut archive = tar::Archive::new(reader);
             archive.unpack(_dst).map_err(BinaryError::DecompressError)
         }
         #[cfg(feature = "zip")]
         Extension::Zip => {
-            let reader = std::io::Cursor::new(_file);
+            let reader = io::BufReader::new(open(_file)?);
             let mut archive =
                 zip::ZipArchive::new(reader).map_err(|e| BinaryError::DecompressError(e.into()))?;
             archive
@@ -780,15 +887,15 @@ fn decompress(_file: &[u8], _dst: &Path, ext: Extension) -> Result<(), BinaryErr
         }
         #[cfg(all(feature = "pkg", target_os = "macos"))]
         Extension::Pkg => {
-            let reader = std::io::Cursor::new(_file);
+            let reader = io::BufReader::new(open(_file)?);
             pkg_extractor::PkgExtractor::new(reader, Some(_dst.into()))
                 .extract()
                 .map_err(|e| BinaryError::DecompressError(std::io::Error::other(format!("{e:?}"))))
         }
         #[cfg(all(feature = "inno", target_os = "windows"))]
         Extension::Inno => {
-            let cursor = std::io::Cursor::new(_file);
-            let mut inno = inno::Inno::new(cursor)
+            let reader = io::BufReader::new(open(_file)?);
+            let mut inno = inno::Inno::new(reader)
                 .map_err(|e| BinaryError::DecompressError(std::io::Error::other(e.to_string())))?;
             for file in inno.files() {
                 let (entry, data) = file.map_err(|e| {
@@ -1004,7 +1111,11 @@ mod tests {
             checksum: Some("0".repeat(64)),
             paths: None,
         };
-        make_available(bin, &create_temp_dir(name).join("dst"))
+        let dst = create_temp_dir(name).join("dst");
+        let result = make_available(bin, &dst);
+        // The streamed archive never outlives the call, whatever the outcome.
+        assert!(!TempDownload::path(&dst).exists());
+        result
     }
 
     #[cfg(feature = "xz")]
@@ -1040,6 +1151,94 @@ mod tests {
         let url = serve_once("Content-Encoding: gzip\r\nContent-Length: 23\r\n", &GZIP);
         let err = download(url, "compressed").unwrap_err();
         assert!(matches!(err, BinaryError::InvalidChecksum(..)), "{}", err);
+    }
+
+    /// An archive is downloaded once: the next build, in another place, finds it in the cache.
+    #[cfg(feature = "xz")]
+    #[test]
+    fn a_downloaded_archive_is_kept_for_the_next_build() {
+        let body = b"not really an archive".to_vec();
+        let checksum = sha256::digest(&*body);
+        let dir = create_temp_dir("archive_cache");
+        let cache = dir.join("cache");
+        let bin = |url: String| UrlBinary {
+            url,
+            checksum: Some(checksum.clone()),
+            paths: None,
+        };
+
+        let url = serve_once("Content-Length: 21\r\n", &body);
+        // The body is not an archive, so unpacking fails: it is the download that is under test.
+        let first = make_available_in(bin(url), &dir.join("one"), Some(cache.clone()));
+        assert!(
+            matches!(first, Err(BinaryError::DecompressError(_))),
+            "{:?}",
+            first
+        );
+        assert_eq!(fs::read(cache.join(&checksum)).unwrap(), body);
+
+        // Nothing answers at this address any more: an error about the network would mean
+        // that the archive was asked for again.
+        let second = make_available_in(
+            bin("http://127.0.0.1:1/archive.tar.xz".into()),
+            &dir.join("two"),
+            Some(cache.clone()),
+        );
+        assert!(
+            matches!(second, Err(BinaryError::DecompressError(_))),
+            "{:?}",
+            second
+        );
+        // Only the archive is left in the cache, no partial download.
+        assert_eq!(fs::read_dir(&cache).unwrap().count(), 1);
+    }
+
+    /// A corrupt archive in the cache is not trusted: it is downloaded again.
+    #[cfg(feature = "xz")]
+    #[test]
+    fn a_corrupt_cached_archive_is_downloaded_again() {
+        let body = b"not really an archive".to_vec();
+        let checksum = sha256::digest(&*body);
+        let dir = create_temp_dir("archive_cache_corrupt");
+        let cache = dir.join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join(&checksum), b"damaged").unwrap();
+
+        let url = serve_once("Content-Length: 21\r\n", &body);
+        let bin = UrlBinary {
+            url,
+            checksum: Some(checksum.clone()),
+            paths: None,
+        };
+        let result = make_available_in(bin, &dir.join("dst"), Some(cache.clone()));
+        assert!(
+            matches!(result, Err(BinaryError::DecompressError(_))),
+            "{:?}",
+            result
+        );
+        assert_eq!(fs::read(cache.join(&checksum)).unwrap(), body);
+    }
+
+    /// A download that does not match its checksum is never kept.
+    #[cfg(feature = "xz")]
+    #[test]
+    fn a_bad_download_is_not_cached() {
+        let dir = create_temp_dir("archive_cache_bad");
+        let cache = dir.join("cache");
+        let checksum = "a".repeat(64);
+        let url = serve_once("Content-Length: 21\r\n", b"not really an archive");
+        let bin = UrlBinary {
+            url,
+            checksum: Some(checksum),
+            paths: None,
+        };
+        let result = make_available_in(bin, &dir.join("dst"), Some(cache.clone()));
+        assert!(
+            matches!(result, Err(BinaryError::InvalidChecksum(..))),
+            "{:?}",
+            result
+        );
+        assert_eq!(fs::read_dir(&cache).unwrap().count(), 0);
     }
 
     /// Build scripts of several crates ask for the same bundle at once: only one downloads it.

@@ -278,6 +278,13 @@
 //! matched against the target of the crate being built, so a cross build gets the binaries of its target, not those of
 //! the host. Set `SYSTEM_DEPS_NO_PREBUILT` when cross-compiling to a target they don't support.
 //!
+//! Downloaded archives that have a `checksum` are kept in a cache directory, named after their checksum, so that a clean
+//! build, another target directory or another project does not download them again: `$XDG_CACHE_HOME/system-deps` (or
+//! `~/.cache/system-deps`) on Linux and other Unix systems, `~/Library/Caches/system-deps` on macOS and
+//! `%LOCALAPPDATA%\system-deps` on Windows. `SYSTEM_DEPS_CACHE_DIR` sets another directory. A cached archive is used only
+//! if its hash still matches the checksum. Nothing removes old archives from the cache: delete the directory to reclaim
+//! the space. Archives without a checksum and local `file://` archives are not cached.
+//!
 //! Builds on [docs.rs](https://docs.rs) have no network access, so when `DOCS_RS` is set no binaries are downloaded and
 //! [`Config::query_path`] returns `None` for every library. Build scripts that rely on the prebuilt binaries should return
 //! early in that case, before probing or querying paths:
