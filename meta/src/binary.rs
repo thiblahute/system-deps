@@ -128,6 +128,27 @@ pub struct UrlBinary {
     paths: Option<Vec<String>>,
 }
 
+/// What the build scripts of one build share: the paths of the prebuilt binaries, and the
+/// environment variables that were looked at to decide them.
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct CachedPaths {
+    /// Cargo must be told about these by every build script, also by those that read the cache.
+    pub vars: Vec<String>,
+    /// The paths.
+    pub paths: Paths,
+}
+
+/// A key for [`Paths::cached`]: a hash of everything the paths depend on, given as `inputs`.
+pub fn cache_key(inputs: &[&[u8]]) -> String {
+    let mut all = Vec::new();
+    for input in inputs {
+        // Each is preceded by its length, so that moving a byte between two is another key.
+        all.extend_from_slice(&(input.len() as u64).to_le_bytes());
+        all.extend_from_slice(input);
+    }
+    sha256::digest(&*all)
+}
+
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Paths {
     paths: HashMap<String, Vec<PathBuf>>,
@@ -251,6 +272,56 @@ impl Paths {
                 .then_some(v)
                 .and_then(|v| self.paths.get(v))
         })
+    }
+
+    /// Whether every directory listed still exists.
+    fn all_exist(&self) -> bool {
+        self.paths.values().flatten().all(|p| p.exists())
+    }
+
+    /// The paths for `key`, worked out by the first caller and read from a file by the others.
+    ///
+    /// Working them out reads the whole crate graph, and every build script that uses
+    /// `system-deps` needs them. The first one takes a lock and does it (waiting while another one
+    /// is doing it); the rest, in this build and in the next ones, read the result. `key` must
+    /// cover everything the result depends on: see [`cache_key`].
+    pub fn cached(
+        key: &str,
+        compute: impl FnOnce() -> Result<CachedPaths, Error>,
+    ) -> Result<CachedPaths, Error> {
+        let file = Path::new(&crate::TARGET_DIR).join(format!("paths-{key}.toml"));
+        // A copy whose directories are gone (a cleaned target directory) is not worth reading.
+        let read = || -> Option<CachedPaths> {
+            let cached: CachedPaths = toml::from_str(&fs::read_to_string(&file).ok()?).ok()?;
+            cached.paths.all_exist().then_some(cached)
+        };
+        if let Some(cached) = read() {
+            return Ok(cached);
+        }
+
+        match DirLock::acquire(&file.with_extension(""), || Ok(read().is_some()))? {
+            Some(lock) => {
+                let result = compute();
+                match &result {
+                    Ok(cached) => {
+                        // Written under another name and renamed, so nobody reads half of it.
+                        let tmp = file.with_extension(format!("tmp-{}", std::process::id()));
+                        fs::write(&tmp, toml::to_string(cached)?)
+                            .and_then(|_| fs::rename(&tmp, &file))
+                            .map_err(BinaryError::InvalidDirectory)?;
+                    }
+                    Err(error) => lock.record_failure(error),
+                }
+                result
+            }
+            None => read().ok_or_else(|| {
+                BinaryError::InvalidDirectory(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "the shared paths disappeared",
+                ))
+                .into()
+            }),
+        }
     }
 
     /// Serializes the path list.
@@ -440,10 +511,18 @@ impl DirLock {
         Some(BinaryError::DownloadFailedElsewhere(error))
     }
 
-    /// Takes the lock, or returns `None` once the bundle at `dst` became valid while waiting.
-    /// If the owner fails meanwhile, so do we, with its error: retrying one after the other would
-    /// repeat a slow failure once per waiter.
-    fn acquire(dst: &Path, checksum: Option<&str>) -> Result<Option<Self>, BinaryError> {
+    /// `acquire`, for the bundle at `dst`: it is done once it is valid.
+    fn acquire_bundle(dst: &Path, checksum: Option<&str>) -> Result<Option<Self>, BinaryError> {
+        Self::acquire(dst, || check_valid_dir(dst, checksum))
+    }
+
+    /// Takes the lock named after `dst`, or returns `None` once `done` says the work is finished
+    /// while waiting. If the owner fails meanwhile, so do we, with its error: retrying one after
+    /// the other would repeat a slow failure once per waiter.
+    fn acquire(
+        dst: &Path,
+        done: impl Fn() -> Result<bool, BinaryError>,
+    ) -> Result<Option<Self>, BinaryError> {
         let lock = Self::path_of(dst);
         let started = SystemTime::now() - FAILURE_GRACE;
         let mut watch = Watch::new(Instant::now());
@@ -451,7 +530,7 @@ impl DirLock {
             match fs::create_dir(&lock) {
                 Ok(()) => {
                     // Another process may have finished (or failed) between our check and the lock.
-                    if check_valid_dir(dst, checksum)? {
+                    if done()? {
                         let _ = fs::remove_dir(&lock);
                         return Ok(None);
                     }
@@ -467,7 +546,7 @@ impl DirLock {
                     )));
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    if check_valid_dir(dst, checksum)? {
+                    if done()? {
                         return Ok(None);
                     }
                     if let Some(error) = Self::failure_since(dst, started) {
@@ -491,7 +570,7 @@ impl DirLock {
     }
 
     /// Tells the build scripts waiting for us that this failed, so that they fail too.
-    fn record_failure(&self, error: &BinaryError) {
+    fn record_failure(&self, error: &dyn std::fmt::Display) {
         let _ = fs::write(&self.failure, error.to_string());
     }
 
@@ -533,7 +612,7 @@ impl Drop for DirLock {
 
 /// `make_available`, unless another process is already doing it or has done it.
 fn make_available_once(bin: UrlBinary, dst: &Path) -> Result<(), BinaryError> {
-    match DirLock::acquire(dst, bin.checksum.as_deref())? {
+    match DirLock::acquire_bundle(dst, bin.checksum.as_deref())? {
         Some(lock) => {
             let result = make_available(bin, dst);
             if let Err(error) = &result {
@@ -975,7 +1054,7 @@ mod tests {
         thread::scope(|s| {
             for _ in 0..8 {
                 s.spawn(|| {
-                    if let Some(_lock) = DirLock::acquire(&dst, Some(&checksum)).unwrap() {
+                    if let Some(_lock) = DirLock::acquire_bundle(&dst, Some(&checksum)).unwrap() {
                         owners.fetch_add(1, AtomicOrdering::SeqCst);
                         thread::sleep(Duration::from_millis(200));
                         fs::create_dir_all(&dst).unwrap();
@@ -1059,7 +1138,7 @@ mod lock_tests {
         fs::create_dir(DirLock::path_of(&dst)).unwrap();
 
         let start = Instant::now();
-        let lock = DirLock::acquire(&dst, Some(&"a".repeat(64))).unwrap();
+        let lock = DirLock::acquire_bundle(&dst, Some(&"a".repeat(64))).unwrap();
         assert!(lock.is_some());
         assert!(start.elapsed() >= LOCK_STALE, "{:?}", start.elapsed());
         assert!(start.elapsed() < LOCK_STALE * 5, "{:?}", start.elapsed());
@@ -1074,7 +1153,9 @@ mod lock_tests {
 
         thread::scope(|s| {
             s.spawn(|| {
-                let _lock = DirLock::acquire(&dst, Some(&checksum)).unwrap().unwrap();
+                let _lock = DirLock::acquire_bundle(&dst, Some(&checksum))
+                    .unwrap()
+                    .unwrap();
                 owners.fetch_add(1, Ordering::SeqCst);
                 thread::sleep(LOCK_STALE * 4);
                 fs::create_dir_all(&dst).unwrap();
@@ -1083,7 +1164,10 @@ mod lock_tests {
             thread::sleep(LOCK_STALE / 2);
             for _ in 0..3 {
                 s.spawn(|| {
-                    if DirLock::acquire(&dst, Some(&checksum)).unwrap().is_some() {
+                    if DirLock::acquire_bundle(&dst, Some(&checksum))
+                        .unwrap()
+                        .is_some()
+                    {
                         owners.fetch_add(1, Ordering::SeqCst);
                     }
                 });
@@ -1104,14 +1188,16 @@ mod lock_tests {
 
         thread::scope(|s| {
             s.spawn(|| {
-                let lock = DirLock::acquire(&dst, Some(&checksum)).unwrap().unwrap();
+                let lock = DirLock::acquire_bundle(&dst, Some(&checksum))
+                    .unwrap()
+                    .unwrap();
                 owners.fetch_add(1, Ordering::SeqCst);
                 thread::sleep(LOCK_STALE / 2);
                 lock.record_failure(&BinaryError::AntiBot("https://example/archive".into()));
             });
             thread::sleep(Duration::from_millis(100));
             for _ in 0..4 {
-                s.spawn(|| match DirLock::acquire(&dst, Some(&checksum)) {
+                s.spawn(|| match DirLock::acquire_bundle(&dst, Some(&checksum)) {
                     Err(BinaryError::DownloadFailedElsewhere(error)) => {
                         assert!(error.contains("https://example/archive"), "{}", error);
                         failures.fetch_add(1, Ordering::SeqCst);
@@ -1132,7 +1218,7 @@ mod lock_tests {
         fs::write(DirLock::failure_path_of(&dst), "an old error").unwrap();
         thread::sleep(FAILURE_GRACE * 3);
 
-        let lock = DirLock::acquire(&dst, Some(&"a".repeat(64))).unwrap();
+        let lock = DirLock::acquire_bundle(&dst, Some(&"a".repeat(64))).unwrap();
         assert!(lock.is_some());
         assert!(!DirLock::failure_path_of(&dst).exists());
     }
@@ -1187,5 +1273,211 @@ mod lock_tests {
             .expect("a quiet lock is abandoned in the end");
         assert!(declared > LOCK_STALE, "{:?}", declared);
         assert!(declared <= LOCK_STALE + step, "{:?}", declared);
+    }
+
+    fn unique_key(name: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("test-{}-{}-{}", name, std::process::id(), nanos)
+    }
+
+    fn some_paths(dir: &Path) -> CachedPaths {
+        let mut paths = Paths::default();
+        paths.paths.insert("lib".into(), vec![dir.to_path_buf()]);
+        CachedPaths {
+            vars: vec!["SYSTEM_DEPS_LIB_NO_PREBUILT".into()],
+            paths,
+        }
+    }
+
+    /// Many build scripts need the paths at once: one works them out, the others read them.
+    #[test]
+    fn the_paths_are_worked_out_once() {
+        let key = unique_key("once");
+        let dir = bundle("cache_once");
+        let runs = AtomicUsize::new(0);
+
+        thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    let cached = Paths::cached(&key, || {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(200));
+                        Ok(some_paths(dir.parent().unwrap()))
+                    })
+                    .unwrap();
+                    // Everyone learns which variables to tell cargo about, not only the first
+                    assert_eq!(cached.vars, ["SYSTEM_DEPS_LIB_NO_PREBUILT"]);
+                });
+            }
+        });
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        // A later build script, or build, just reads the file
+        let again = Paths::cached(&key, || panic!("the paths should have been read")).unwrap();
+        assert_eq!(again.vars, ["SYSTEM_DEPS_LIB_NO_PREBUILT"]);
+    }
+
+    /// If working the paths out fails, the build scripts waiting for them fail with that error.
+    #[test]
+    fn a_failure_is_shared_with_the_waiters() {
+        let key = unique_key("shared_failure");
+        let failures = AtomicUsize::new(0);
+
+        thread::scope(|s| {
+            s.spawn(|| {
+                let result = Paths::cached(&key, || {
+                    thread::sleep(LOCK_STALE / 2);
+                    Err(BinaryError::AntiBot("https://example/archive".into()).into())
+                });
+                assert!(result.is_err());
+            });
+            thread::sleep(Duration::from_millis(100));
+            for _ in 0..3 {
+                s.spawn(
+                    || match Paths::cached(&key, || panic!("must not be worked out again")) {
+                        Err(Error::Binary(BinaryError::DownloadFailedElsewhere(message))) => {
+                            assert!(message.contains("https://example/archive"), "{}", message);
+                            failures.fetch_add(1, Ordering::SeqCst);
+                        }
+                        other => {
+                            panic!("expected the failure of the first, got {:?}", other.is_ok())
+                        }
+                    },
+                );
+            }
+        });
+        assert_eq!(failures.load(Ordering::SeqCst), 3);
+    }
+
+    /// A copy that lists directories that are gone (a cleaned target directory) is not trusted.
+    #[test]
+    fn paths_whose_directories_are_gone_are_worked_out_again() {
+        let key = unique_key("gone");
+        let first = bundle("cache_gone_first");
+        let second = bundle("cache_gone_second");
+        fs::create_dir_all(&first).unwrap();
+        Paths::cached(&key, || Ok(some_paths(&first))).unwrap();
+
+        fs::remove_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let runs = AtomicUsize::new(0);
+        let cached = Paths::cached(&key, || {
+            runs.fetch_add(1, Ordering::SeqCst);
+            Ok(some_paths(&second))
+        })
+        .unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(cached.paths.paths["lib"], [second]);
+    }
+
+    #[test]
+    fn the_key_depends_on_every_input_and_where_it_ends() {
+        assert_eq!(cache_key(&[b"a", b"b"]), cache_key(&[b"a", b"b"]));
+        assert_ne!(cache_key(&[b"a", b"b"]), cache_key(&[b"a", b"c"]));
+        // Moving a byte from one input to the next is another key
+        assert_ne!(cache_key(&[b"ab", b"c"]), cache_key(&[b"a", b"bc"]));
+    }
+}
+
+/// The lock between real processes: each one is a copy of the test executable, running `child`.
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+    use std::{
+        io::Write,
+        process::{Child, Command, Stdio},
+    };
+
+    const CHECKSUM: &str = "b";
+
+    fn dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("system_deps_process_{name}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn spawn(dir: &Path, role: &str) -> Child {
+        Command::new(std::env::current_exe().unwrap())
+            .args(["process_tests::child", "--nocapture", "--test-threads=1"])
+            .env("SYSTEM_DEPS_LOCK_TEST_DIR", dir)
+            .env("SYSTEM_DEPS_LOCK_TEST_ROLE", role)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    /// Not a test by itself: the body of the processes the tests below start.
+    #[test]
+    fn child() {
+        let (Some(dir), Some(role)) = (
+            std::env::var_os("SYSTEM_DEPS_LOCK_TEST_DIR"),
+            std::env::var("SYSTEM_DEPS_LOCK_TEST_ROLE").ok(),
+        ) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let dst = dir.join("bundle");
+        let Some(_lock) = DirLock::acquire_bundle(&dst, Some(CHECKSUM)).unwrap() else {
+            return;
+        };
+        let mut owners = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("owners.log"))
+            .unwrap();
+        writeln!(owners, "{}", std::process::id()).unwrap();
+        drop(owners);
+        if role == "hang" {
+            fs::write(dir.join("hanging"), "").unwrap();
+            thread::sleep(Duration::from_secs(120));
+        }
+        thread::sleep(LOCK_STALE * 2);
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(dst.join("checksum"), CHECKSUM).unwrap();
+    }
+
+    fn owners(dir: &Path) -> usize {
+        fs::read_to_string(dir.join("owners.log"))
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// Several processes want the same bundle: one makes it, the others wait for it.
+    #[test]
+    fn only_one_process_makes_a_bundle() {
+        let dir = dir("one");
+        let children: Vec<Child> = (0..6).map(|_| spawn(&dir, "worker")).collect();
+        for mut child in children {
+            assert!(child.wait().unwrap().success());
+        }
+        assert_eq!(owners(&dir), 1);
+        assert!(dir.join("bundle").join("checksum").is_file());
+        assert!(!DirLock::path_of(&dir.join("bundle")).exists());
+    }
+
+    /// The owner is killed in the middle of the work: the next process takes over.
+    #[test]
+    fn a_killed_process_does_not_block_the_next() {
+        let dir = dir("killed");
+        let mut owner = spawn(&dir, "hang");
+        let start = Instant::now();
+        while !dir.join("hanging").exists() {
+            assert!(start.elapsed() < Duration::from_secs(20), "no owner");
+            thread::sleep(Duration::from_millis(20));
+        }
+        owner.kill().unwrap();
+        owner.wait().unwrap();
+        assert!(DirLock::path_of(&dir.join("bundle")).exists());
+
+        let start = Instant::now();
+        assert!(spawn(&dir, "worker").wait().unwrap().success());
+        assert!(start.elapsed() < LOCK_STALE * 10, "{:?}", start.elapsed());
+        assert_eq!(owners(&dir), 2);
+        assert!(dir.join("bundle").join("checksum").is_file());
     }
 }
