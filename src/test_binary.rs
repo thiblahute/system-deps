@@ -408,10 +408,10 @@ fn file_types() -> Result<(), Error> {
 #[test]
 fn unsupported_extensions() -> Result<(), Error> {
     let mut pkgs = vec![Package {
-        name: "dep",
+        name: "unsupported_dep",
         deps: vec![],
         config: toml::toml![
-            [package.metadata.system-deps.dep]
+            [package.metadata.system-deps.unsupported_dep]
             url = "http://unsuported.ext"
         ],
     }];
@@ -419,7 +419,7 @@ fn unsupported_extensions() -> Result<(), Error> {
     assert!(Test::new("unsupported_extension", pkgs.clone()).is_err());
 
     pkgs[0].config = toml::toml![
-        [package.metadata.system-deps.dep]
+        [package.metadata.system-deps.unsupported_dep]
         url = "http://no_ext"
     ];
 
