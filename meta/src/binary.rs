@@ -1427,3 +1427,103 @@ mod lock_tests {
         assert_ne!(cache_key(&[b"ab", b"c"]), cache_key(&[b"a", b"bc"]));
     }
 }
+
+/// The lock between real processes: each one is a copy of the test executable, running `child`.
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+    use std::{
+        io::Write,
+        process::{Child, Command, Stdio},
+    };
+
+    const CHECKSUM: &str = "b";
+
+    fn dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("system_deps_process_{name}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn spawn(dir: &Path, role: &str) -> Child {
+        Command::new(std::env::current_exe().unwrap())
+            .args(["process_tests::child", "--nocapture", "--test-threads=1"])
+            .env("SYSTEM_DEPS_LOCK_TEST_DIR", dir)
+            .env("SYSTEM_DEPS_LOCK_TEST_ROLE", role)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    /// Not a test by itself: the body of the processes the tests below start.
+    #[test]
+    fn child() {
+        let (Some(dir), Some(role)) = (
+            std::env::var_os("SYSTEM_DEPS_LOCK_TEST_DIR"),
+            std::env::var("SYSTEM_DEPS_LOCK_TEST_ROLE").ok(),
+        ) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let dst = dir.join("bundle");
+        let Some(_lock) = DirLock::acquire_bundle(&dst, Some(CHECKSUM)).unwrap() else {
+            return;
+        };
+        let mut owners = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("owners.log"))
+            .unwrap();
+        writeln!(owners, "{}", std::process::id()).unwrap();
+        drop(owners);
+        if role == "hang" {
+            fs::write(dir.join("hanging"), "").unwrap();
+            thread::sleep(Duration::from_secs(120));
+        }
+        thread::sleep(LOCK_STALE * 2);
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(dst.join("checksum"), CHECKSUM).unwrap();
+    }
+
+    fn owners(dir: &Path) -> usize {
+        fs::read_to_string(dir.join("owners.log"))
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// Several processes want the same bundle: one makes it, the others wait for it.
+    #[test]
+    fn only_one_process_makes_a_bundle() {
+        let dir = dir("one");
+        let children: Vec<Child> = (0..6).map(|_| spawn(&dir, "worker")).collect();
+        for mut child in children {
+            assert!(child.wait().unwrap().success());
+        }
+        assert_eq!(owners(&dir), 1);
+        assert!(dir.join("bundle").join("checksum").is_file());
+        assert!(!DirLock::path_of(&dir.join("bundle")).exists());
+    }
+
+    /// The owner is killed in the middle of the work: the next process takes over.
+    #[test]
+    fn a_killed_process_does_not_block_the_next() {
+        let dir = dir("killed");
+        let mut owner = spawn(&dir, "hang");
+        let start = Instant::now();
+        while !dir.join("hanging").exists() {
+            assert!(start.elapsed() < Duration::from_secs(20), "no owner");
+            thread::sleep(Duration::from_millis(20));
+        }
+        owner.kill().unwrap();
+        owner.wait().unwrap();
+        assert!(DirLock::path_of(&dir.join("bundle")).exists());
+
+        let start = Instant::now();
+        assert!(spawn(&dir, "worker").wait().unwrap().success());
+        assert!(start.elapsed() < LOCK_STALE * 10, "{:?}", start.elapsed());
+        assert_eq!(owners(&dir), 2);
+        assert!(dir.join("bundle").join("checksum").is_file());
+    }
+}
