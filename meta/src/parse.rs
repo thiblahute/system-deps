@@ -36,8 +36,12 @@ impl MetadataNode {
 
 /// Recursively evaluate `cfg()` keys in a table and merge matching ones.
 fn filter_cfg(table: &mut Table) -> Result<(), Error> {
-    let target = get_builtin_target_by_triple(env!("SYSTEM_DEPS_TARGET"))
-        .expect("The target set by the build script should be valid");
+    // This runs inside the build script of the crate being built, where `TARGET` is the target
+    // that crate is compiled for. The value baked in by this crate's own build script is the host
+    // when this crate is a build dependency, so it is only the fallback (outside a build script).
+    let triple = std::env::var("TARGET").unwrap_or_else(|_| env!("SYSTEM_DEPS_TARGET").to_string());
+    let target = get_builtin_target_by_triple(&triple)
+        .unwrap_or_else(|| panic!("The target `{}` is not a built-in Rust target", triple));
     filter_cfg_inner(table, target)
 }
 

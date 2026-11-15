@@ -33,6 +33,19 @@ jobs:
           args: install pkgconfiglite --allow-empty-checksums
       - run: cargo test --workspace --all-features
 
+  # What the prebuilt binaries are for: building for a target that is not the machine's own.
+  cross:
+    name: Cross compilation
+    runs-on: ubuntu-latest
+    env:
+      SYSTEM_DEPS_REQUIRE_CROSS: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-linux-android,aarch64-linux-android
+      - run: cargo test --test cross --all-features
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest

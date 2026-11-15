@@ -272,8 +272,11 @@
 //! `SYSTEM_DEPS_NO_PREBUILT` disables all the prebuilt binaries, and `SYSTEM_DEPS_$NAME_NO_PREBUILT` those of a single
 //! library and of the libraries that follow it. Disabled binaries are not downloaded, and `pkg-config` looks for the
 //! libraries in its usual paths. The prebuilt paths take precedence over `PKG_CONFIG_PATH` and its target specific
-//! variants, but the binaries are selected for the host, so set `SYSTEM_DEPS_NO_PREBUILT` when cross-compiling to a
-//! target they don't support.
+//! variants.
+//!
+//! The binaries are selected and downloaded the first time a build script asks for them, and the `cfg()` keys are
+//! matched against the target of the crate being built, so a cross build gets the binaries of its target, not those of
+//! the host. Set `SYSTEM_DEPS_NO_PREBUILT` when cross-compiling to a target they don't support.
 //!
 //! Builds on [docs.rs](https://docs.rs) have no network access, so when `DOCS_RS` is set no binaries are downloaded and
 //! [`Config::query_path`] returns `None` for every library. Build scripts that rely on the prebuilt binaries should return
@@ -804,6 +807,68 @@ impl Drop for EnvRestore {
     }
 }
 
+/// The pkg-config paths of the prebuilt binaries, downloaded the first time they are needed.
+///
+/// This runs inside the build script of the crate being built, where `TARGET` is the target that
+/// crate is compiled for, so the `cfg()` keys of the binary metadata match the right platform even
+/// when cross compiling. (This crate is a build dependency, so its own build script could only
+/// ever see the host.)
+#[cfg(feature = "binary")]
+fn binary_paths() -> &'static system_deps_meta::binary::Paths {
+    use system_deps_meta::{
+        binary::{merge, no_prebuilt_var, skip_disabled, Paths},
+        parse::read_metadata,
+        BUILD_MANIFEST,
+    };
+
+    fn no_prebuilt(var: &str) -> bool {
+        println!("cargo:rerun-if-env-changed={}", var);
+        env::var(var).is_ok()
+    }
+
+    static PATHS: std::sync::OnceLock<Paths> = std::sync::OnceLock::new();
+    PATHS.get_or_init(|| {
+        println!("cargo:rerun-if-env-changed=DOCS_RS");
+        if env::var_os("DOCS_RS").is_some() || no_prebuilt(&no_prebuilt_var(None)) {
+            return Paths::default();
+        }
+
+        // Read metadata from the crate graph
+        let metadata = read_metadata(BUILD_MANIFEST, "system-deps", merge)
+            .unwrap_or_else(|e| panic!("Couldn't read the prebuilt binaries metadata: {}", e));
+
+        // Skip the binaries disabled with `SYSTEM_DEPS_$NAME_NO_PREBUILT`, and those following them
+        let metadata = skip_disabled(metadata, no_prebuilt);
+
+        // Download the binaries (once, whichever build script gets here first) and get their paths
+        let paths = Paths::from_binaries(metadata)
+            .unwrap_or_else(|e| panic!("Couldn't get the prebuilt binaries: {}", e));
+
+        // On Windows the test/run binaries need the prebuilt bin directory on PATH at runtime:
+        // rustc-link-search only affects linking, and Cargo doesn't set PATH for executed test
+        // binaries. Surface the directories so the user can prepend them.
+        #[cfg(windows)]
+        {
+            let dirs = paths.dll_search_dirs();
+            if !dirs.is_empty() {
+                let joined =
+                    env::join_paths(&dirs).expect("DLL search dir contains invalid character");
+                let joined = joined.to_string_lossy();
+                println!(
+                    "cargo:warning=To run tests/binaries, copy & paste (PowerShell): $env:PATH = \"{};$env:PATH\"",
+                    joined
+                );
+                println!(
+                    "cargo:warning=To run tests/binaries, copy & paste (cmd.exe):   set \"PATH={};%PATH%\"",
+                    joined
+                );
+            }
+        }
+
+        paths
+    })
+}
+
 /// Structure used to configure `metadata` before starting to probe for dependencies
 pub struct Config {
     env: EnvVariables,
@@ -829,16 +894,7 @@ impl Config {
             env,
             build_internals: HashMap::new(),
             #[cfg(feature = "binary")]
-            paths: {
-                // Constructed by reading the serialized value saved by the build script
-                const CONTENT: &str = include_str!(env!("SYSTEM_DEPS_BINARY_PATHS"));
-                static PATHS: std::sync::OnceLock<system_deps_meta::binary::Paths> =
-                    std::sync::OnceLock::new();
-                PATHS.get_or_init(|| {
-                    toml::from_str(CONTENT)
-                        .expect("The build script should output valid serialization")
-                })
-            },
+            paths: binary_paths(),
         };
 
         // Prefer the pkg-config shipped by a downloaded bundle. The bundle's
