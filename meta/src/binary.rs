@@ -3,8 +3,9 @@ use std::{
     convert::{TryFrom, TryInto},
     fs, io,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{mpsc, Mutex, OnceLock},
     thread,
+    time::{Duration, Instant, SystemTime},
 };
 
 use heck::ToShoutySnakeCase;
@@ -172,7 +173,7 @@ impl Paths {
 
                 // Allow multiple downloads at the same time
                 if !valid {
-                    handles.push(s.spawn(move || make_available(bin, &dst)));
+                    handles.push(s.spawn(move || make_available_once(bin, &dst)));
                 }
             }
 
@@ -343,6 +344,204 @@ fn check_valid_dir(dst: &Path, checksum: Option<&str>) -> Result<bool, BinaryErr
             && ch == fs::read_to_string(file).map_err(BinaryError::InvalidDirectory)?)
     } else {
         Ok(false)
+    }
+}
+
+/// A lock whose owner shows no sign of life for this long is taken over: the owner was killed.
+#[cfg(not(test))]
+const LOCK_STALE: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const LOCK_STALE: Duration = Duration::from_millis(800);
+
+/// A failure recorded by a lock's owner counts for those that started waiting up to this long
+/// before it, to allow for the file system's coarse timestamps.
+#[cfg(not(test))]
+const FAILURE_GRACE: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const FAILURE_GRACE: Duration = Duration::from_millis(100);
+
+/// Decides when the owner of a lock is gone.
+struct Watch {
+    seen: Option<(Vec<Option<SystemTime>>, Instant)>,
+    last_check: Instant,
+}
+
+impl Watch {
+    fn new(now: Instant) -> Self {
+        Self {
+            seen: None,
+            last_check: now,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.seen = None;
+    }
+
+    /// Whether a lock showing these signs of life, at `now`, looks abandoned: they have not
+    /// changed for a whole window. The clock is ours (monotonic), so a wall clock that jumps or is
+    /// skewed cannot make a live owner look dead.
+    fn abandoned(&mut self, signs: Vec<Option<SystemTime>>, now: Instant) -> bool {
+        // Time in which we did not run is no evidence: if the machine was suspended, or this
+        // process stalled, the owner was most likely stopped as well and could not show a sign.
+        // The clock may or may not have counted that time, so start counting again either way.
+        if now.duration_since(self.last_check) > LOCK_STALE / 2 {
+            self.seen = None;
+        }
+        self.last_check = now;
+        match &self.seen {
+            Some((last, since)) if *last == signs => now.duration_since(*since) > LOCK_STALE,
+            _ => {
+                self.seen = Some((signs, now));
+                false
+            }
+        }
+    }
+}
+
+/// Held while one process downloads and unpacks a bundle. Several build scripts can ask for the
+/// same bundle at once, so the others wait for the checksum file instead of downloading it again.
+///
+/// The lock is a directory next to the bundle's: creating one is atomic on every platform. While
+/// it is held, a thread keeps rewriting a heartbeat file inside it, so that a lock left behind by
+/// a process that was killed (Ctrl-C during a long download) is noticed and taken over instead of
+/// making every later build wait for an owner that is gone.
+struct DirLock {
+    path: PathBuf,
+    failure: PathBuf,
+    stop: Option<mpsc::Sender<()>>,
+    beat: Option<thread::JoinHandle<()>>,
+}
+
+impl DirLock {
+    fn path_of(dst: &Path) -> PathBuf {
+        Self::sibling(dst, ".lock")
+    }
+
+    /// Where an owner that failed leaves its error for the others.
+    fn failure_path_of(dst: &Path) -> PathBuf {
+        Self::sibling(dst, ".failed")
+    }
+
+    fn sibling(dst: &Path, suffix: &str) -> PathBuf {
+        let mut path = dst.as_os_str().to_owned();
+        path.push(suffix);
+        PathBuf::from(path)
+    }
+
+    /// The error an owner left after we started waiting, if any.
+    fn failure_since(dst: &Path, started: SystemTime) -> Option<BinaryError> {
+        let failure = Self::failure_path_of(dst);
+        let at = fs::metadata(&failure).and_then(|m| m.modified()).ok()?;
+        if at < started {
+            return None;
+        }
+        let error = fs::read_to_string(&failure).unwrap_or_default();
+        Some(BinaryError::DownloadFailedElsewhere(error))
+    }
+
+    /// Takes the lock, or returns `None` once the bundle at `dst` became valid while waiting.
+    /// If the owner fails meanwhile, so do we, with its error: retrying one after the other would
+    /// repeat a slow failure once per waiter.
+    fn acquire(dst: &Path, checksum: Option<&str>) -> Result<Option<Self>, BinaryError> {
+        let lock = Self::path_of(dst);
+        let started = SystemTime::now() - FAILURE_GRACE;
+        let mut watch = Watch::new(Instant::now());
+        loop {
+            match fs::create_dir(&lock) {
+                Ok(()) => {
+                    // Another process may have finished (or failed) between our check and the lock.
+                    if check_valid_dir(dst, checksum)? {
+                        let _ = fs::remove_dir(&lock);
+                        return Ok(None);
+                    }
+                    if let Some(error) = Self::failure_since(dst, started) {
+                        let _ = fs::remove_dir(&lock);
+                        return Err(error);
+                    }
+                    // An error left by an earlier build is not ours to report.
+                    let _ = fs::remove_file(Self::failure_path_of(dst));
+                    return Ok(Some(Self::start_heartbeat(
+                        lock,
+                        Self::failure_path_of(dst),
+                    )));
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    if check_valid_dir(dst, checksum)? {
+                        return Ok(None);
+                    }
+                    if let Some(error) = Self::failure_since(dst, started) {
+                        return Err(error);
+                    }
+                    let signs: Vec<Option<SystemTime>> = [lock.clone(), lock.join("heartbeat")]
+                        .iter()
+                        .map(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
+                        .collect();
+                    if watch.abandoned(signs, Instant::now()) {
+                        // Nobody touched the lock for a whole window: its owner is gone.
+                        let _ = fs::remove_dir_all(&lock);
+                        watch.reset();
+                        continue;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => return Err(BinaryError::InvalidDirectory(e)),
+            }
+        }
+    }
+
+    /// Tells the build scripts waiting for us that this failed, so that they fail too.
+    fn record_failure(&self, error: &BinaryError) {
+        let _ = fs::write(&self.failure, error.to_string());
+    }
+
+    fn start_heartbeat(path: PathBuf, failure: PathBuf) -> Self {
+        let (stop, rx) = mpsc::channel::<()>();
+        let heartbeat = path.join("heartbeat");
+        let beat = thread::spawn(move || {
+            let mut count = 0u64;
+            loop {
+                // The content changes every time, so the modification time always does.
+                count += 1;
+                let _ = fs::write(&heartbeat, count.to_string());
+                if !matches!(
+                    rx.recv_timeout(LOCK_STALE / 4),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    break;
+                }
+            }
+        });
+        Self {
+            path,
+            failure,
+            stop: Some(stop),
+            beat: Some(beat),
+        }
+    }
+}
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(beat) = self.beat.take() {
+            let _ = beat.join();
+        }
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// `make_available`, unless another process is already doing it or has done it.
+fn make_available_once(bin: UrlBinary, dst: &Path) -> Result<(), BinaryError> {
+    match DirLock::acquire(dst, bin.checksum.as_deref())? {
+        Some(lock) => {
+            let result = make_available(bin, dst);
+            if let Err(error) = &result {
+                lock.record_failure(error);
+            }
+            result
+        }
+        None => Ok(()),
     }
 }
 
@@ -764,6 +963,34 @@ mod tests {
         assert!(matches!(err, BinaryError::InvalidChecksum(..)), "{}", err);
     }
 
+    /// Build scripts of several crates ask for the same bundle at once: only one downloads it.
+    #[test]
+    fn only_one_thread_downloads_a_bundle() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let dst = create_temp_dir("lock").join("bundle");
+        let checksum = "a".repeat(64);
+        let owners = AtomicUsize::new(0);
+
+        thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    if let Some(_lock) = DirLock::acquire(&dst, Some(&checksum)).unwrap() {
+                        owners.fetch_add(1, AtomicOrdering::SeqCst);
+                        thread::sleep(Duration::from_millis(200));
+                        fs::create_dir_all(&dst).unwrap();
+                        fs::write(dst.join("checksum"), &checksum).unwrap();
+                    }
+                });
+            }
+        });
+
+        assert_eq!(owners.load(AtomicOrdering::SeqCst), 1);
+        assert!(check_valid_dir(&dst, Some(&checksum)).unwrap());
+        // The lock is released at the end
+        assert!(!dst.with_extension("lock").exists());
+    }
+
     #[test]
     fn no_prebuilt_var_names() {
         assert_eq!(no_prebuilt_var(None), "SYSTEM_DEPS_NO_PREBUILT");
@@ -810,5 +1037,155 @@ mod tests {
             ]),
             ["libc"]
         );
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn bundle(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("system_deps_test_{}", name));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("bundle")
+    }
+
+    /// A lock directory left behind by a process that was killed does not block the next build.
+    #[test]
+    fn abandoned_lock_is_taken_over() {
+        let dst = bundle("abandoned");
+        fs::create_dir(DirLock::path_of(&dst)).unwrap();
+
+        let start = Instant::now();
+        let lock = DirLock::acquire(&dst, Some(&"a".repeat(64))).unwrap();
+        assert!(lock.is_some());
+        assert!(start.elapsed() >= LOCK_STALE, "{:?}", start.elapsed());
+        assert!(start.elapsed() < LOCK_STALE * 5, "{:?}", start.elapsed());
+    }
+
+    /// A live owner that takes much longer than the staleness window keeps its lock.
+    #[test]
+    fn live_owner_keeps_the_lock_while_it_works() {
+        let dst = bundle("live");
+        let checksum = "a".repeat(64);
+        let owners = AtomicUsize::new(0);
+
+        thread::scope(|s| {
+            s.spawn(|| {
+                let _lock = DirLock::acquire(&dst, Some(&checksum)).unwrap().unwrap();
+                owners.fetch_add(1, Ordering::SeqCst);
+                thread::sleep(LOCK_STALE * 4);
+                fs::create_dir_all(&dst).unwrap();
+                fs::write(dst.join("checksum"), &checksum).unwrap();
+            });
+            thread::sleep(LOCK_STALE / 2);
+            for _ in 0..3 {
+                s.spawn(|| {
+                    if DirLock::acquire(&dst, Some(&checksum)).unwrap().is_some() {
+                        owners.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(owners.load(Ordering::SeqCst), 1);
+        assert!(!DirLock::path_of(&dst).exists());
+    }
+
+    /// When the owner fails, the others fail with its error instead of trying again in turn.
+    #[test]
+    fn waiters_fail_with_the_owners_error() {
+        let dst = bundle("failed");
+        let checksum = "a".repeat(64);
+        let owners = AtomicUsize::new(0);
+        let failures = AtomicUsize::new(0);
+
+        thread::scope(|s| {
+            s.spawn(|| {
+                let lock = DirLock::acquire(&dst, Some(&checksum)).unwrap().unwrap();
+                owners.fetch_add(1, Ordering::SeqCst);
+                thread::sleep(LOCK_STALE / 2);
+                lock.record_failure(&BinaryError::AntiBot("https://example/archive".into()));
+            });
+            thread::sleep(Duration::from_millis(100));
+            for _ in 0..4 {
+                s.spawn(|| match DirLock::acquire(&dst, Some(&checksum)) {
+                    Err(BinaryError::DownloadFailedElsewhere(error)) => {
+                        assert!(error.contains("https://example/archive"), "{}", error);
+                        failures.fetch_add(1, Ordering::SeqCst);
+                    }
+                    other => panic!("expected the owner's failure, got {:?}", other.map(|_| ())),
+                });
+            }
+        });
+
+        assert_eq!(owners.load(Ordering::SeqCst), 1);
+        assert_eq!(failures.load(Ordering::SeqCst), 4);
+    }
+
+    /// An error left by an earlier build does not stop a later one from trying.
+    #[test]
+    fn an_earlier_failure_does_not_block_a_new_build() {
+        let dst = bundle("earlier");
+        fs::write(DirLock::failure_path_of(&dst), "an old error").unwrap();
+        thread::sleep(FAILURE_GRACE * 3);
+
+        let lock = DirLock::acquire(&dst, Some(&"a".repeat(64))).unwrap();
+        assert!(lock.is_some());
+        assert!(!DirLock::failure_path_of(&dst).exists());
+    }
+
+    fn signs(secs: u64) -> Vec<Option<SystemTime>> {
+        vec![
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs)),
+            None,
+        ]
+    }
+
+    #[test]
+    fn watch_declares_a_quiet_lock_abandoned() {
+        let t0 = Instant::now();
+        let mut watch = Watch::new(t0);
+        let step = LOCK_STALE / 4;
+        assert!(!watch.abandoned(signs(1), t0));
+        assert!(!watch.abandoned(signs(1), t0 + step));
+        assert!(!watch.abandoned(signs(1), t0 + step * 2));
+        assert!(!watch.abandoned(signs(1), t0 + step * 3));
+        assert!(watch.abandoned(signs(1), t0 + LOCK_STALE + step / 2));
+    }
+
+    #[test]
+    fn watch_keeps_a_lock_that_shows_signs_of_life() {
+        let t0 = Instant::now();
+        let mut watch = Watch::new(t0);
+        let step = LOCK_STALE / 4;
+        for i in 0..40u32 {
+            // The owner's heartbeat changes the signs every step.
+            assert!(!watch.abandoned(signs(i as u64), t0 + step * i));
+        }
+    }
+
+    /// The machine was suspended: the owner could not beat either, so the window starts over.
+    #[test]
+    fn watch_does_not_count_time_we_did_not_run() {
+        let t0 = Instant::now();
+        let mut watch = Watch::new(t0);
+        assert!(!watch.abandoned(signs(1), t0));
+
+        // A long gap between two checks (whatever the clock says about it) and still nothing new
+        let resumed = t0 + LOCK_STALE * 10;
+        assert!(!watch.abandoned(signs(1), resumed));
+
+        // Only a whole quiet window after the resume, checked as often as the real loop does,
+        // makes the lock abandoned.
+        let step = LOCK_STALE / 8;
+        let declared = (1..=12u32)
+            .map(|i| step * i)
+            .find(|elapsed| watch.abandoned(signs(1), resumed + *elapsed))
+            .expect("a quiet lock is abandoned in the end");
+        assert!(declared > LOCK_STALE, "{:?}", declared);
+        assert!(declared <= LOCK_STALE + step, "{:?}", declared);
     }
 }

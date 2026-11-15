@@ -85,6 +85,8 @@ mod binary {
         AntiBot(String),
         /// The binary archive extension is not currently supported.
         UnsupportedExtension(String),
+        /// Another build script was downloading the same binaries and failed.
+        DownloadFailedElsewhere(String),
     }
 
     impl From<BinaryError> for super::Error {
@@ -144,6 +146,13 @@ mod binary {
                          1. Open in a browser: {url}\n\
                          2. Save the file locally\n\
                          3. Update your Cargo.toml url to: file:///path/to/downloaded/file"
+                    )
+                }
+                Self::DownloadFailedElsewhere(error) => {
+                    write!(
+                        f,
+                        "Another build script failed to get the binaries: {}",
+                        error
                     )
                 }
                 Self::UnsupportedExtension(ext) => {

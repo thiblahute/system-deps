@@ -48,7 +48,12 @@ fn replace_paths(name: &str, table: &mut Table) {
         match v {
             Value::String(v) if k == "url" && v == "$TEST" => {
                 let folder = COUNT.fetch_add(1, Ordering::Relaxed);
-                let dir = format!("{}/paths/{}/{}", env!("OUT_DIR"), name, folder);
+                let dir = std::env::temp_dir()
+                    .join("system-deps-tests")
+                    .join(name)
+                    .join(folder.to_string())
+                    .display()
+                    .to_string();
                 fs::create_dir_all(&dir).expect("Failed to create test paths");
                 *v = format!("file://{}", dir);
             }
