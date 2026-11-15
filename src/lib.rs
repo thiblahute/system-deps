@@ -813,7 +813,7 @@ impl Drop for EnvRestore {
 #[cfg(feature = "binary")]
 fn binary_paths() -> &'static system_deps_meta::binary::Paths {
     use system_deps_meta::{
-        binary::{merge, no_prebuilt_var, skip_disabled, Paths},
+        binary::{cache_key, merge, no_prebuilt_var, skip_disabled, CachedPaths, Paths},
         parse::read_metadata,
         BUILD_MANIFEST,
     };
@@ -830,16 +830,55 @@ fn binary_paths() -> &'static system_deps_meta::binary::Paths {
             return Paths::default();
         }
 
-        // Read metadata from the crate graph
-        let metadata = read_metadata(BUILD_MANIFEST, "system-deps", merge)
-            .unwrap_or_else(|e| panic!("Couldn't read the prebuilt binaries metadata: {}", e));
+        // Everything the paths depend on: the target, the metadata of the crate graph (its top
+        // manifest and the lock file that fixes the versions below it) and this crate's variables.
+        let manifest = std::path::Path::new(BUILD_MANIFEST);
+        let lock = manifest
+            .ancestors()
+            .skip(1)
+            .map(|dir| dir.join("Cargo.lock"))
+            .find(|lock| lock.is_file());
+        let mut vars: Vec<String> = env::vars()
+            .filter(|(name, _)| name.starts_with("SYSTEM_DEPS_"))
+            .map(|(name, value)| format!("{}={}\n", name, value))
+            .collect();
+        vars.sort();
+        let key = cache_key(&[
+            env!("CARGO_PKG_VERSION").as_bytes(),
+            env::var("TARGET").unwrap_or_default().as_bytes(),
+            BUILD_MANIFEST.as_bytes(),
+            &std::fs::read(manifest).unwrap_or_default(),
+            &lock.and_then(|l| std::fs::read(l).ok()).unwrap_or_default(),
+            vars.concat().as_bytes(),
+        ]);
 
-        // Skip the binaries disabled with `SYSTEM_DEPS_$NAME_NO_PREBUILT`, and those following them
-        let metadata = skip_disabled(metadata, no_prebuilt);
+        // The first build script to get here works the paths out, downloading the binaries on the
+        // way; the others read the result. `TARGET` is the target of the crate being built here.
+        let cached = Paths::cached(&key, || {
+            // Read metadata from the crate graph
+            let metadata = read_metadata(BUILD_MANIFEST, "system-deps", merge)?;
 
-        // Download the binaries (once, whichever build script gets here first) and get their paths
-        let paths = Paths::from_binaries(metadata)
-            .unwrap_or_else(|e| panic!("Couldn't get the prebuilt binaries: {}", e));
+            // Skip the binaries disabled with `SYSTEM_DEPS_$NAME_NO_PREBUILT`, and those following
+            // them, and remember which variables that looked at
+            let mut consulted = Vec::new();
+            let metadata = skip_disabled(metadata, |var| {
+                consulted.push(var.to_string());
+                no_prebuilt(var)
+            });
+
+            Ok(CachedPaths {
+                vars: consulted,
+                paths: Paths::from_binaries(metadata)?,
+            })
+        })
+        .unwrap_or_else(|e| panic!("Couldn't get the prebuilt binaries: {}", e));
+
+        // Cargo needs each build script to say which variables it looked at, also when another
+        // one did the work.
+        for var in &cached.vars {
+            println!("cargo:rerun-if-env-changed={}", var);
+        }
+        let paths = cached.paths;
 
         // On Windows the test/run binaries need the prebuilt bin directory on PATH at runtime:
         // rustc-link-search only affects linking, and Cargo doesn't set PATH for executed test
