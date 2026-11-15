@@ -1,7 +1,8 @@
 use std::{
     collections::HashMap,
     convert::{TryFrom, TryInto},
-    fs, io,
+    fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::{mpsc, Mutex, OnceLock},
     thread,
@@ -653,9 +654,11 @@ fn make_available(bin: UrlBinary, dst: &Path) -> Result<(), BinaryError> {
         return Ok(());
     }
 
-    // Use a local file or download from the web
-    let (file, expected_len) = if local {
-        (fs::read(url).map_err(BinaryError::LocalFileError)?, None)
+    // Use a local file, or stream the download to a temporary file next to the bundle.
+    // The archive is never held in memory: it is hashed and extracted from disk.
+    let mut temp = None;
+    let (file, expected_len): (PathBuf, Option<u64>) = if local {
+        (PathBuf::from(url), None)
     } else {
         let res = attohttpc::get(url)
             .header("User-Agent", "system-deps")
@@ -663,20 +666,33 @@ fn make_available(bin: UrlBinary, dst: &Path) -> Result<(), BinaryError> {
         if res.status() == attohttpc::StatusCode::IM_A_TEAPOT {
             return Err(BinaryError::AntiBot(url.into()));
         }
-        let res = res.error_for_status()?;
+        let mut res = res.error_for_status()?;
         let expected_len = expected_len(res.headers());
-        (res.bytes()?, expected_len)
+        let path = TempDownload::path(dst);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(BinaryError::DecompressError)?;
+        }
+        let guard = temp.insert(TempDownload(path));
+        let mut out =
+            io::BufWriter::new(fs::File::create(&guard.0).map_err(BinaryError::DecompressError)?);
+        io::copy(&mut res, &mut out)
+            .and_then(|_| out.flush())
+            .map_err(|e| BinaryError::DownloadError(e.into()))?;
+        (guard.0.clone(), expected_len)
     };
 
     // Verify the checksum
-    let calculated = sha256::digest(&*file);
+    let calculated = sha256::try_digest(file.as_path()).map_err(BinaryError::LocalFileError)?;
+    let received = fs::metadata(&file)
+        .map_err(BinaryError::LocalFileError)?
+        .len();
     let checksum = match bin.checksum {
         Some(ch) if *ch == calculated => Ok(ch),
         _ => match expected_len {
-            Some(len) if (file.len() as u64) < len => Err(BinaryError::DownloadError(
+            Some(len) if received < len => Err(BinaryError::DownloadError(
                 io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    format!("{url}: received {} of {len} bytes", file.len()),
+                    format!("{url}: received {received} of {len} bytes"),
                 )
                 .into(),
             )),
@@ -691,6 +707,7 @@ fn make_available(bin: UrlBinary, dst: &Path) -> Result<(), BinaryError> {
 
     // Decompress the binary archive
     decompress(&file, dst, ext)?;
+    drop(temp);
 
     // Generate info.toml with auto-detected pkgconfig paths
     create_info_file(dst)?;
@@ -750,14 +767,36 @@ fn create_info_file(dst: &Path) -> Result<(), BinaryError> {
     .map_err(BinaryError::DecompressError)
 }
 
+/// A downloaded archive in a temporary file, removed when dropped.
+struct TempDownload(PathBuf);
+
+impl TempDownload {
+    fn path(dst: &Path) -> PathBuf {
+        let mut name = dst.file_name().unwrap_or_default().to_os_string();
+        name.push(".download");
+        dst.with_file_name(name)
+    }
+}
+
+impl Drop for TempDownload {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(any(feature = "gz", feature = "xz", feature = "zip"))]
+fn open(path: &Path) -> Result<fs::File, BinaryError> {
+    fs::File::open(path).map_err(BinaryError::DecompressError)
+}
+
 /// Extract a binary archive to the target directory. The methods for unpacking are
 /// different depending on the extension. Each file type is gated behind a feature to
 /// avoid having too many dependencies.
-fn decompress(_file: &[u8], _dst: &Path, ext: Extension) -> Result<(), BinaryError> {
+fn decompress(_file: &Path, _dst: &Path, ext: Extension) -> Result<(), BinaryError> {
     match ext {
         #[cfg(feature = "gz")]
         Extension::TarGz => {
-            let reader = flate2::read::GzDecoder::new(_file);
+            let reader = flate2::read::GzDecoder::new(open(_file)?);
             let mut archive = tar::Archive::new(reader);
             archive.unpack(_dst).map_err(BinaryError::DecompressError)
         }
@@ -765,13 +804,13 @@ fn decompress(_file: &[u8], _dst: &Path, ext: Extension) -> Result<(), BinaryErr
         Extension::TarXz => {
             // `true`: allow concatenated xz streams, matching the
             // multi-stream tolerance of the previous liblzma decoder.
-            let reader = lzma_rust2::XzReader::new(_file, true);
+            let reader = lzma_rust2::XzReader::new(io::BufReader::new(open(_file)?), true);
             let mut archive = tar::Archive::new(reader);
             archive.unpack(_dst).map_err(BinaryError::DecompressError)
         }
         #[cfg(feature = "zip")]
         Extension::Zip => {
-            let reader = std::io::Cursor::new(_file);
+            let reader = io::BufReader::new(open(_file)?);
             let mut archive =
                 zip::ZipArchive::new(reader).map_err(|e| BinaryError::DecompressError(e.into()))?;
             archive
@@ -780,14 +819,17 @@ fn decompress(_file: &[u8], _dst: &Path, ext: Extension) -> Result<(), BinaryErr
         }
         #[cfg(all(feature = "pkg", target_os = "macos"))]
         Extension::Pkg => {
-            let reader = std::io::Cursor::new(_file);
+            // These two formats are still read whole: their extractors need the bytes.
+            let reader =
+                std::io::Cursor::new(fs::read(_file).map_err(BinaryError::DecompressError)?);
             pkg_extractor::PkgExtractor::new(reader, Some(_dst.into()))
                 .extract()
                 .map_err(|e| BinaryError::DecompressError(std::io::Error::other(format!("{e:?}"))))
         }
         #[cfg(all(feature = "inno", target_os = "windows"))]
         Extension::Inno => {
-            let cursor = std::io::Cursor::new(_file);
+            let cursor =
+                std::io::Cursor::new(fs::read(_file).map_err(BinaryError::DecompressError)?);
             let mut inno = inno::Inno::new(cursor)
                 .map_err(|e| BinaryError::DecompressError(std::io::Error::other(e.to_string())))?;
             for file in inno.files() {
@@ -1004,7 +1046,11 @@ mod tests {
             checksum: Some("0".repeat(64)),
             paths: None,
         };
-        make_available(bin, &create_temp_dir(name).join("dst"))
+        let dst = create_temp_dir(name).join("dst");
+        let result = make_available(bin, &dst);
+        // The streamed archive never outlives the call, whatever the outcome.
+        assert!(!TempDownload::path(&dst).exists());
+        result
     }
 
     #[cfg(feature = "xz")]
